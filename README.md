@@ -136,13 +136,22 @@ This solution enforces:
 * Controlled reporting outputs
 
 /* =========================================================================================================
+   PROJECT: Investment Portfolio Reclassification & Multi-Period Reporting
+   FILE: mi_monthly_quarterly_report.sql
 
-   DESIGN PRINCIPLES:
-       - No hardcoded dates
-       - Deterministic valuation logic
-       - Audit-friendly structure
-       - Excel-ready output
+   PURPOSE:
+   - Reclassify AssetType_3 into reporting categories
+   - Apply deterministic valuation logic (Exposure vs Market Value)
+   - Produce Current Month, Previous Month, Current Quarter, Previous Quarter outputs
+   - Deliver pivot-ready, audit-safe dataset
+
+   DESIGN:
+   - No hardcoded dates
+   - Period-filtered CTEs (no conditional CASE by date)
+   - Single reporting grain
+   - Clean valuation separation
 ========================================================================================================= */
+
 
 -- ========================================================================================================
 -- 1. DATE PARAMETERS
@@ -151,7 +160,7 @@ This solution enforces:
 DECLARE @CurrentMonth DATE;
 
 SELECT @CurrentMonth = MAX(Report_Date)
-FROM [dbo].[T_Dataset_Exhaustive_Aligned];
+FROM dbo.T_Dataset_Exhaustive_Aligned;
 
 DECLARE @PreviousMonth DATE = EOMONTH(@CurrentMonth, -1);
 
@@ -164,183 +173,244 @@ DECLARE @PreviousQuarter DATE =
     EOMONTH(@CurrentQuarter, -3);
 
 
+
 -- ========================================================================================================
 -- 2. ASSET RECLASSIFICATION TABLE
 -- ========================================================================================================
 
 DECLARE @New_Assets TABLE
 (
-    ID INT IDENTITY(1,1),
     Asset_type_1 NVARCHAR(10),
     Asset_type_2 NVARCHAR(10),
-    Asset_type_3 NVARCHAR(10),
-    New_Asset_type_1 NVARCHAR(10),
-    New_Asset_type_2 NVARCHAR(10),
+    Asset_type_3 NVARCHAR(25),
     New_Asset_type_3 NVARCHAR(25)
 );
 
--- Bond Futures → Offset
 INSERT INTO @New_Assets VALUES
-('A','Type_1','BondFuture','A','Type_1','R_Offset'),
-('B','Type_2','BondFuture','B','Type_2','R_Offset'),
-('C','Type_3','BondFuture','C','Type_3','R_Offset'),
-('D','Type_4','BondFuture','D','Type_4','R_Offset'),
-('E','Type_5','BondFuture','E','Type_5','R_Offset');
+('A','Type_1','BondFuture','R_Offset'),
+('A','Type_1','Option','R_Derivative'),
+('A','Type_1','CDS','R_Derivative'),
+('A','Type_1','IRS','R_Derivative'),
+('A','Type_1','TRS','R_Derivative'),
+('A','Type_1','FXForward','R_Derivative'),
+('A','Type_1','Equity','R_Physical'),
+('A','Type_1','Cash','R_Physical');
 
--- Derivatives
-INSERT INTO @New_Assets VALUES
-('A','Type_1','Option','A','Type_1','R_Derivative'),
-('A','Type_1','CDS','A','Type_1','R_Derivative'),
-('A','Type_1','IRS','A','Type_1','R_Derivative'),
-('A','Type_1','TRS','A','Type_1','R_Derivative'),
-('A','Type_1','FXForward','A','Type_1','R_Derivative');
-
--- Physical
-INSERT INTO @New_Assets VALUES
-('A','Type_1','Equity','A','Type_1','R_Physical'),
-('A','Type_1','Cash','A','Type_1','R_Physical');
 
 
 -- ========================================================================================================
--- 3. RECLASSIFICATION CONTROL TABLE
+-- 3. BASE DATASET WITH RECLASSIFICATION + VALUATION FLAG
 -- ========================================================================================================
 
-DECLARE @Reclassify_Asset_3 TABLE
-(
-    ID INT IDENTITY(1,1),
-    Asset_Type_3 NVARCHAR(25),
-    Non_Asset_Type_3 NVARCHAR(25)
-);
-
-INSERT INTO @Reclassify_Asset_3 VALUES
-('Bond Future','Bond Future'),
-('Equity','Equity'),
-(NULL,'FXForward'),
-('Option','Option');
-
-
--- ========================================================================================================
--- 4. BASE DATASET CTE
--- ========================================================================================================
-
-WITH Main_CTE AS
+WITH Base_Data AS
 (
     SELECT
-        Report_Date,
-        Entity,
-        Portfolio,
-        Desk,
-        Trader,
-        Instrument_ID,
-        Security_Name,
-        AssetType_1,
-        AssetType_2,
-        AssetType_3,
-        Parent_Fund,
-        Sub_Fund,
-        Currency,
-        Country,
-        Region,
-        Rating,
+        A.Report_Date,
+        A.Entity,
+        A.Portfolio,
+        A.Desk,
+        A.Trader,
+        A.Instrument_ID,
+        A.Security_Name,
+        A.AssetType_1,
+        A.AssetType_2,
+        A.AssetType_3,
+        A.Parent_Fund,
+        A.Sub_Fund,
+        A.Currency,
+        A.Country,
+        A.Region,
+        A.Rating,
+        A.Accounting_Code,
+        A.Derivative_Group,
+        A.Derivative_Flag,
+        A.DerivativeOffset_Flag,
+        A.Market_Value_Base,
+        A.Exposure_Base,
+
+        COALESCE(N.New_Asset_type_3, 'Unmapped') AS Reporting_Asset_Type,
+
+        CASE
+            WHEN A.AssetType_3 IN ('Bond Future','Option')
+                THEN 1
+            ELSE 0
+        END AS Use_Exposure_Flag
+
+    FROM dbo.T_Dataset_Exhaustive_Aligned A
+    LEFT JOIN @New_Assets N
+        ON A.AssetType_1 = N.Asset_type_1
+        AND A.AssetType_2 = N.Asset_type_2
+        AND A.AssetType_3 = N.Asset_type_3
+),
+
+
+
+-- ========================================================================================================
+-- 4. CURRENT MONTH
+-- ========================================================================================================
+
+CM AS
+(
+    SELECT
+        Entity, Portfolio, Desk, Trader,
+        Instrument_ID, Security_Name,
+        AssetType_1, AssetType_2, AssetType_3,
+        Parent_Fund, Sub_Fund,
+        Currency, Country, Region, Rating,
         Accounting_Code,
-        Derivative_Group,
-        Derivative_Flag,
-        DerivativeOffset_Flag,
-        Market_Value_Base,
-        Exposure_Base
-    FROM dbo.T_Dataset_Exhaustive_Aligned
-),
+        Reporting_Asset_Type,
 
--- ========================================================================================================
--- 5. CURRENT MONTH LOGIC
--- ========================================================================================================
+        SUM(Market_Value_Base) AS CM_MV_Core,
+        SUM(Exposure_Base) AS CM_EX_Core,
 
-Current_Month_CTE AS
-(
-    SELECT
-        A1.*,
-        SUM(A1.Market_Value_Base) AS MV_Core,
-        SUM(A1.Exposure_Base) AS EX_Core,
+        SUM(CASE
+                WHEN Use_Exposure_Flag = 1
+                    THEN Exposure_Base
+                ELSE Market_Value_Base
+            END) AS CM_Report_Value
 
-        CASE
-            WHEN A1.Report_Date = @CurrentMonth
-                 AND A1.AssetType_3 IN (
-                     SELECT Asset_Type_3
-                     FROM @Reclassify_Asset_3
-                     WHERE Asset_Type_3 IS NOT NULL
-                 )
-            THEN SUM(A1.Exposure_Base)
-            ELSE SUM(A1.Market_Value_Base)
-        END AS Current_MV,
-
-        CASE
-            WHEN A1.Report_Date = @CurrentQuarter
-                 AND A1.AssetType_3 IN (
-                     SELECT Asset_Type_3
-                     FROM @Reclassify_Asset_3
-                     WHERE Asset_Type_3 IS NOT NULL
-                 )
-            THEN SUM(A1.Exposure_Base)
-            ELSE SUM(A1.Market_Value_Base)
-        END AS Current_Quarter_MV
-
-    FROM Main_CTE A1
+    FROM Base_Data
+    WHERE Report_Date = @CurrentMonth
     GROUP BY
-        Report_Date, Entity, Portfolio, Desk, Trader,
+        Entity, Portfolio, Desk, Trader,
         Instrument_ID, Security_Name,
         AssetType_1, AssetType_2, AssetType_3,
         Parent_Fund, Sub_Fund,
         Currency, Country, Region, Rating,
-        Accounting_Code, Derivative_Group,
-        Derivative_Flag, DerivativeOffset_Flag
+        Accounting_Code,
+        Reporting_Asset_Type
 ),
 
+
+
 -- ========================================================================================================
--- 6. PREVIOUS MONTH LOGIC
+-- 5. PREVIOUS MONTH
 -- ========================================================================================================
 
-Previous_Month_CTE AS
+PM AS
 (
     SELECT
-        A1.*,
-
-        CASE
-            WHEN A1.AssetType_3 IN (
-                SELECT Asset_Type_3
-                FROM @Reclassify_Asset_3
-                WHERE Asset_Type_3 IS NOT NULL
-            )
-            THEN SUM(A1.Exposure_Base)
-            ELSE SUM(A1.Market_Value_Base)
-        END AS Previous_MV
-
-    FROM Main_CTE A1
-    GROUP BY
-        Report_Date, Entity, Portfolio, Desk, Trader,
+        Entity, Portfolio, Desk, Trader,
         Instrument_ID, Security_Name,
         AssetType_1, AssetType_2, AssetType_3,
         Parent_Fund, Sub_Fund,
         Currency, Country, Region, Rating,
-        Accounting_Code, Derivative_Group,
-        Derivative_Flag, DerivativeOffset_Flag
+        Accounting_Code,
+        Reporting_Asset_Type,
+
+        SUM(Market_Value_Base) AS PM_MV_Core,
+        SUM(Exposure_Base) AS PM_EX_Core,
+
+        SUM(CASE
+                WHEN Use_Exposure_Flag = 1
+                    THEN Exposure_Base
+                ELSE Market_Value_Base
+            END) AS PM_Report_Value
+
+    FROM Base_Data
+    WHERE Report_Date = @PreviousMonth
+    GROUP BY
+        Entity, Portfolio, Desk, Trader,
+        Instrument_ID, Security_Name,
+        AssetType_1, AssetType_2, AssetType_3,
+        Parent_Fund, Sub_Fund,
+        Currency, Country, Region, Rating,
+        Accounting_Code,
+        Reporting_Asset_Type
+),
+
+
+
+-- ========================================================================================================
+-- 6. CURRENT QUARTER
+-- ========================================================================================================
+
+CQ AS
+(
+    SELECT
+        Entity, Portfolio, Desk, Trader,
+        Instrument_ID, Security_Name,
+        AssetType_1, AssetType_2, AssetType_3,
+        Parent_Fund, Sub_Fund,
+        Currency, Country, Region, Rating,
+        Accounting_Code,
+        Reporting_Asset_Type,
+
+        SUM(CASE
+                WHEN Use_Exposure_Flag = 1
+                    THEN Exposure_Base
+                ELSE Market_Value_Base
+            END) AS CQ_Report_Value
+
+    FROM Base_Data
+    WHERE Report_Date = @CurrentQuarter
+    GROUP BY
+        Entity, Portfolio, Desk, Trader,
+        Instrument_ID, Security_Name,
+        AssetType_1, AssetType_2, AssetType_3,
+        Parent_Fund, Sub_Fund,
+        Currency, Country, Region, Rating,
+        Accounting_Code,
+        Reporting_Asset_Type
+),
+
+
+
+-- ========================================================================================================
+-- 7. PREVIOUS QUARTER
+-- ========================================================================================================
+
+PQ AS
+(
+    SELECT
+        Entity, Portfolio, Desk, Trader,
+        Instrument_ID, Security_Name,
+        AssetType_1, AssetType_2, AssetType_3,
+        Parent_Fund, Sub_Fund,
+        Currency, Country, Region, Rating,
+        Accounting_Code,
+        Reporting_Asset_Type,
+
+        SUM(CASE
+                WHEN Use_Exposure_Flag = 1
+                    THEN Exposure_Base
+                ELSE Market_Value_Base
+            END) AS PQ_Report_Value
+
+    FROM Base_Data
+    WHERE Report_Date = @PreviousQuarter
+    GROUP BY
+        Entity, Portfolio, Desk, Trader,
+        Instrument_ID, Security_Name,
+        AssetType_1, AssetType_2, AssetType_3,
+        Parent_Fund, Sub_Fund,
+        Currency, Country, Region, Rating,
+        Accounting_Code,
+        Reporting_Asset_Type
 )
 
+
+
 -- ========================================================================================================
--- 7. FINAL OUTPUT
+-- 8. FINAL OUTPUT (CURRENT MONTH UNIVERSE)
 -- ========================================================================================================
 
 SELECT
-    @CurrentQuarter AS Current_Quarter,
-    @PreviousQuarter AS Previous_Quarter,
     @CurrentMonth AS Current_Month,
     @PreviousMonth AS Previous_Month,
-    A1.*,
-    COALESCE(B1.Current_MV, 0) AS Current_MV,
-    COALESCE(B1.Current_Quarter_MV, 0) AS Current_Quarter_MV,
-    COALESCE(C1.Previous_MV, 0) AS Previous_MV
+    @CurrentQuarter AS Current_Quarter,
+    @PreviousQuarter AS Previous_Quarter,
 
-FROM Main_CTE A1
-LEFT JOIN Current_Month_CTE B1
-    ON A1.Instrument_ID = B1.Instrument_ID
-LEFT JOIN Previous_Month_CTE C1
-    ON A1.Instrument_ID = C1.Instrument_ID;
+    CM.*,
+
+    COALESCE(PM.PM_Report_Value,0) AS Previous_Month_Value,
+    COALESCE(CQ.CQ_Report_Value,0) AS Current_Quarter_Value,
+    COALESCE(PQ.PQ_Report_Value,0) AS Previous_Quarter_Value
+
+FROM CM
+LEFT JOIN PM
+    ON CM.Instrument_ID = PM.Instrument_ID
+LEFT JOIN CQ
+    ON CM.Instrument_ID = CQ.Instrument_ID
+LEFT JOIN PQ
+    ON CM.Instrument_ID = PQ.Instrument_ID;
